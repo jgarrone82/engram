@@ -125,7 +125,15 @@ func main() {
 
 	cfg, cfgErr := store.DefaultConfig()
 	if cfgErr != nil {
-		fatal(cfgErr)
+		// Fallback: try to resolve home directory from environment variables
+		// that os.UserHomeDir() might have missed (e.g. MCP subprocesses on
+		// Windows where %USERPROFILE% is not propagated).
+		if home := resolveHomeFallback(); home != "" {
+			log.Printf("[engram] UserHomeDir failed, using fallback: %s", home)
+			cfg = store.FallbackConfig(filepath.Join(home, ".engram"))
+		} else {
+			fatal(cfgErr)
+		}
 	}
 
 	// Allow overriding data dir via env
@@ -1857,6 +1865,34 @@ MCP Configuration (add to your agent's config):
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "engram: %s\n", err)
 	exitFunc(1)
+}
+
+// resolveHomeFallback tries platform-specific environment variables to find
+// a home directory when os.UserHomeDir() fails. This commonly happens on
+// Windows when engram is launched as an MCP subprocess without full env
+// propagation.
+func resolveHomeFallback() string {
+	// Windows: try common env vars that might be set even when
+	// %USERPROFILE% is missing.
+	for _, env := range []string{"USERPROFILE", "HOME", "LOCALAPPDATA"} {
+		if v := os.Getenv(env); v != "" {
+			if env == "LOCALAPPDATA" {
+				// LOCALAPPDATA is C:\Users\<user>\AppData\Local — go up two levels.
+				parent := filepath.Dir(filepath.Dir(v))
+				if parent != "." && parent != v {
+					return parent
+				}
+			}
+			return v
+		}
+	}
+
+	// Unix: $HOME should always work, but try passwd-style fallback.
+	if v := os.Getenv("HOME"); v != "" {
+		return v
+	}
+
+	return ""
 }
 
 // migrateOrphanedDB checks for engram databases that ended up in wrong

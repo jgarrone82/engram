@@ -8,18 +8,13 @@
 //	engram save           Save a memory from CLI
 //	engram context        Show recent context
 //	engram stats          Show memory stats
-//	engram cloud <cmd>    Cloud sync commands
 package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,13 +22,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud"
-	"github.com/Gentleman-Programming/engram/internal/cloud/auth"
-	"github.com/Gentleman-Programming/engram/internal/cloud/autosync"
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudserver"
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
-	"github.com/Gentleman-Programming/engram/internal/cloud/dashboard"
-	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
 	"github.com/Gentleman-Programming/engram/internal/mcp"
 	"github.com/Gentleman-Programming/engram/internal/server"
 	"github.com/Gentleman-Programming/engram/internal/setup"
@@ -93,21 +81,7 @@ var (
 
 	exitFunc = os.Exit
 
-	// Autosync test seams
-	autosyncNew       = autosync.New
-	autosyncDefaultCg = autosync.DefaultConfig
-
-	// Cloud test seams
-	cloudStoreNew   = cloudstore.New
-	cloudStoreClose = func(cs *cloudstore.CloudStore) error { return cs.Close() }
-	cloudAuthNew    = auth.NewService
-	cloudServerNew  = func(cs *cloudstore.CloudStore, svc *auth.Service, port int, opts ...cloudserver.Option) *cloudserver.CloudServer {
-		return cloudserver.New(cs, svc, port, opts...)
-	}
-	cloudServerStart   = func(srv *cloudserver.CloudServer) error { return srv.Start() }
-	remoteTransportNew = remote.NewRemoteTransport
-	cloudHTTPClient    = func() *http.Client { return http.DefaultClient }
-	stdinScanner       = func() *bufio.Scanner { return bufio.NewScanner(os.Stdin) }
+	stdinScanner = func() *bufio.Scanner { return bufio.NewScanner(os.Stdin) }
 	userHomeDir        = os.UserHomeDir
 )
 
@@ -168,8 +142,6 @@ func main() {
 		cmdImport(cfg)
 	case "sync":
 		cmdSync(cfg)
-	case "cloud":
-		cmdCloud(cfg)
 	case "setup":
 		cmdSetup()
 	case "version", "--version", "-v":
@@ -181,56 +153,6 @@ func main() {
 		printUsage()
 		exitFunc(1)
 	}
-}
-
-// ─── Autosync Adapter ────────────────────────────────────────────────────────
-
-// syncStatusAdapter bridges autosync.Manager.Status() → server.SyncStatusProvider.
-type syncStatusAdapter struct {
-	mgr *autosync.Manager
-}
-
-func (a *syncStatusAdapter) Status() server.SyncStatus {
-	s := a.mgr.Status()
-	return server.SyncStatus{
-		Phase:               s.Phase,
-		LastError:           s.LastError,
-		ConsecutiveFailures: s.ConsecutiveFailures,
-		BackoffUntil:        s.BackoffUntil,
-		LastSyncAt:          s.LastSyncAt,
-	}
-}
-
-// tryStartAutosync attempts to create and start a background sync manager.
-// Returns (manager, cancel) on success, or (nil, nil) if cloud is not configured.
-func tryStartAutosync(s *store.Store, dataDir string) (*autosync.Manager, context.CancelFunc) {
-	serverURL, token, err := resolveCloudClientConfig(dataDir, "", "", true)
-	if err != nil || serverURL == "" || token == "" {
-		return nil, nil
-	}
-
-	rt, err := remoteTransportNew(serverURL, token)
-	if err != nil {
-		log.Printf("[engram] autosync: failed to create transport: %v", err)
-		return nil, nil
-	}
-
-	// Configure token refresh if available.
-	if cc, err := loadCloudConfig(dataDir); err == nil && cc != nil && cc.ServerURL == serverURL && cc.RefreshToken != "" {
-		rt.SetTokenRefresher(cc.RefreshToken, func(newToken string) error {
-			cc.Token = newToken
-			return saveCloudConfig(dataDir, cc)
-		})
-	}
-
-	cfg := autosyncDefaultCg()
-	mgr := autosyncNew(s, rt, cfg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go mgr.Run(ctx)
-
-	log.Printf("[engram] autosync: background sync started (server: %s)", serverURL)
-	return mgr, cancel
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -256,13 +178,6 @@ func cmdServe(cfg store.Config) {
 	defer s.Close()
 
 	srv := newHTTPServer(s, port)
-
-	// Start background autosync if cloud is configured.
-	if mgr, cancel := tryStartAutosync(s, cfg.DataDir); mgr != nil {
-		defer cancel()
-		srv.SetOnWrite(mgr.NotifyDirty)
-		srv.SetSyncStatus(&syncStatusAdapter{mgr: mgr})
-	}
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	sigCh := make(chan os.Signal, 1)
@@ -296,12 +211,6 @@ func cmdMCP(cfg store.Config) {
 	}
 	defer s.Close()
 
-	// Start background autosync if cloud is configured.
-	// MCP is a long-lived stdio process — same lifecycle as serve.
-	if _, cancel := tryStartAutosync(s, cfg.DataDir); cancel != nil {
-		defer cancel()
-	}
-
 	var mcpSrv *mcpserver.MCPServer
 	if toolsFilter != "" {
 		allowlist := resolveMCPTools(toolsFilter)
@@ -331,15 +240,13 @@ func cmdTUI(cfg store.Config) {
 
 func cmdSearch(cfg store.Config) {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N] [--remote URL] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "usage: engram search <query> [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]")
 		exitFunc(1)
 	}
 
 	// Collect the query (everything that's not a flag)
 	var queryParts []string
 	opts := store.SearchOptions{Limit: 10}
-	remoteURL := ""
-	token := ""
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -365,16 +272,6 @@ func cmdSearch(cfg store.Config) {
 				opts.Scope = os.Args[i+1]
 				i++
 			}
-		case "--remote", "-r":
-			if i+1 < len(os.Args) {
-				remoteURL = os.Args[i+1]
-				i++
-			}
-		case "--token", "-t":
-			if i+1 < len(os.Args) {
-				token = os.Args[i+1]
-				i++
-			}
 		default:
 			queryParts = append(queryParts, os.Args[i])
 		}
@@ -384,18 +281,6 @@ func cmdSearch(cfg store.Config) {
 	if query == "" {
 		fmt.Fprintln(os.Stderr, "error: search query is required")
 		exitFunc(1)
-	}
-
-	resolvedRemoteURL, resolvedToken, err := resolveCloudClientConfig(cfg.DataDir, remoteURL, token, false)
-	if err != nil {
-		fatal(err)
-		return
-	}
-
-	// Remote cloud search
-	if resolvedRemoteURL != "" {
-		remoteSearch(resolvedRemoteURL, resolvedToken, query, opts)
-		return
 	}
 
 	s, err := storeNew(cfg)
@@ -572,22 +457,10 @@ func cmdTimeline(cfg store.Config) {
 
 func cmdContext(cfg store.Config) {
 	project := ""
-	remoteURL := ""
-	token := ""
 	scope := ""
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
-		case "--remote", "-r":
-			if i+1 < len(os.Args) {
-				remoteURL = os.Args[i+1]
-				i++
-			}
-		case "--token", "-t":
-			if i+1 < len(os.Args) {
-				token = os.Args[i+1]
-				i++
-			}
 		case "--scope":
 			if i+1 < len(os.Args) {
 				scope = os.Args[i+1]
@@ -600,25 +473,13 @@ func cmdContext(cfg store.Config) {
 		}
 	}
 
-	resolvedRemoteURL, resolvedToken, err := resolveCloudClientConfig(cfg.DataDir, remoteURL, token, false)
-	if err != nil {
-		fatal(err)
-		return
-	}
-
-	// Remote cloud context
-	if resolvedRemoteURL != "" {
-		remoteContext(resolvedRemoteURL, resolvedToken, project, scope)
-		return
-	}
-
 	s, err := storeNew(cfg)
 	if err != nil {
 		fatal(err)
 	}
 	defer s.Close()
 
-	ctx, err := storeFormatContext(s, project, "")
+	ctx, err := storeFormatContext(s, project, scope)
 	if err != nil {
 		fatal(err)
 	}
@@ -728,8 +589,6 @@ func cmdSync(cfg store.Config) {
 	doStatus := false
 	doAll := false
 	project := ""
-	remoteURL := ""
-	token := ""
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--import":
@@ -741,16 +600,6 @@ func cmdSync(cfg store.Config) {
 		case "--project":
 			if i+1 < len(os.Args) {
 				project = os.Args[i+1]
-				i++
-			}
-		case "--remote", "-r":
-			if i+1 < len(os.Args) {
-				remoteURL = os.Args[i+1]
-				i++
-			}
-		case "--token", "-t":
-			if i+1 < len(os.Args) {
-				token = os.Args[i+1]
 				i++
 			}
 		}
@@ -772,19 +621,6 @@ func cmdSync(cfg store.Config) {
 		fatal(err)
 	}
 	defer s.Close()
-
-	resolvedRemoteURL, resolvedToken, err := resolveCloudClientConfig(cfg.DataDir, remoteURL, token, false)
-	if err != nil {
-		fatal(err)
-	}
-	if resolvedRemoteURL != "" {
-		rt, err := remoteTransportNew(resolvedRemoteURL, resolvedToken)
-		if err != nil {
-			fatal(err)
-		}
-		handleRemoteSync(s, rt, doStatus, doImport, doAll, project)
-		return
-	}
 
 	sy := engramsync.NewLocal(s, syncDir)
 
@@ -852,71 +688,6 @@ func cmdSync(cfg store.Config) {
 	fmt.Println()
 	fmt.Println("Add to git:")
 	fmt.Printf("  git add .engram/ && git commit -m \"sync engram memories\"\n")
-}
-
-func handleRemoteSync(s *store.Store, transport engramsync.Transport, doStatus, doImport, doAll bool, project string) {
-	sy := engramsync.NewWithTransport(s, transport)
-
-	if doStatus {
-		local, remoteCount, pending, err := syncStatus(sy)
-		if err != nil {
-			fatal(err)
-		}
-		fmt.Printf("Sync status:\n")
-		fmt.Printf("  Local chunks:    %d\n", local)
-		fmt.Printf("  Remote chunks:   %d\n", remoteCount)
-		fmt.Printf("  Pending import:  %d\n", pending)
-		return
-	}
-
-	if doImport {
-		result, err := syncImport(sy)
-		if err != nil {
-			fatal(fmt.Errorf("pull: %w", err))
-		}
-		if result.ChunksImported == 0 {
-			fmt.Println("Nothing new to pull.")
-			return
-		}
-		fmt.Printf("Pulled %d chunk(s) (%d sessions, %d observations, %d prompts)\n",
-			result.ChunksImported, result.SessionsImported, result.ObservationsImported, result.PromptsImported)
-		return
-	}
-
-	username := engramsync.GetUsername()
-	if doAll {
-		fmt.Println("Pushing ALL memories to remote...")
-	} else if project != "" {
-		fmt.Printf("Pushing memories for project %q to remote...\n", project)
-	}
-
-	exportResult, err := syncExport(sy, username, project)
-	if err != nil {
-		fatal(fmt.Errorf("push: %w", err))
-	}
-	if exportResult.IsEmpty {
-		fmt.Println("Nothing new to push.")
-	} else {
-		fmt.Printf("Pushed chunk %s (%d sessions, %d observations, %d prompts)\n",
-			exportResult.ChunkID,
-			exportResult.SessionsExported,
-			exportResult.ObservationsExported,
-			exportResult.PromptsExported)
-	}
-
-	importResult, err := syncImport(sy)
-	if err != nil {
-		fatal(fmt.Errorf("pull: %w", err))
-	}
-	if importResult.ChunksImported == 0 {
-		fmt.Println("Nothing new to pull.")
-		return
-	}
-	fmt.Printf("Pulled %d chunk(s) (%d sessions, %d observations, %d prompts)\n",
-		importResult.ChunksImported,
-		importResult.SessionsImported,
-		importResult.ObservationsImported,
-		importResult.PromptsImported)
 }
 
 func cmdSetup() {
@@ -1009,788 +780,6 @@ func printPostInstall(agent string) {
 	}
 }
 
-// ─── Cloud Commands ──────────────────────────────────────────────────────────
-
-// CloudConfig holds saved cloud credentials at ~/.engram/cloud.json.
-type CloudConfig struct {
-	ServerURL    string `json:"server_url"`
-	Token        string `json:"token"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	UserID       string `json:"user_id"`
-	Username     string `json:"username"`
-}
-
-func cloudConfigPath(dataDir string) string {
-	if dataDir != "" {
-		return filepath.Join(dataDir, "cloud.json")
-	}
-	home, err := userHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".engram", "cloud.json")
-}
-
-func loadCloudConfig(dataDir string) (*CloudConfig, error) {
-	path := cloudConfigPath(dataDir)
-	if path == "" {
-		return nil, fmt.Errorf("could not determine home directory")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cc CloudConfig
-	if err := json.Unmarshal(data, &cc); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	return &cc, nil
-}
-
-func resolveCloudClientConfig(dataDir, cliServerURL, cliToken string, useConfigServer bool) (string, string, error) {
-	serverURL := cliServerURL
-	token := cliToken
-
-	if serverURL == "" {
-		serverURL = os.Getenv("ENGRAM_REMOTE_URL")
-	}
-	if token == "" {
-		token = os.Getenv("ENGRAM_TOKEN")
-	}
-
-	var cc *CloudConfig
-	if loaded, err := loadCloudConfig(dataDir); err == nil {
-		cc = loaded
-	}
-	if useConfigServer && serverURL == "" && cc != nil {
-		serverURL = cc.ServerURL
-	}
-	if token == "" && cc != nil {
-		token = cc.Token
-	}
-
-	if serverURL == "" {
-		return "", "", nil
-	}
-	if token == "" {
-		return "", "", fmt.Errorf("cloud config missing token (provide --token, ENGRAM_TOKEN, or login first)")
-	}
-	return serverURL, token, nil
-}
-
-func saveCloudConfig(dataDir string, cc *CloudConfig) error {
-	path := cloudConfigPath(dataDir)
-	if path == "" {
-		return fmt.Errorf("could not determine home directory")
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
-	data, err := json.MarshalIndent(cc, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
-}
-
-func cmdCloud(cfg store.Config) {
-	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: engram cloud <serve|register|login|sync|sync-status|status|api-key|enroll|unenroll|projects>")
-		exitFunc(1)
-		return
-	}
-
-	switch os.Args[2] {
-	case "serve":
-		cmdCloudServe()
-	case "register":
-		cmdCloudRegister(cfg.DataDir)
-	case "login":
-		cmdCloudLogin(cfg.DataDir)
-	case "sync":
-		cmdCloudSync(cfg)
-	case "sync-status":
-		cmdCloudSyncStatus(cfg)
-	case "status":
-		cmdCloudStatus(cfg)
-	case "api-key":
-		cmdCloudAPIKey(cfg.DataDir)
-	case "enroll":
-		cmdCloudEnroll(cfg)
-	case "unenroll":
-		cmdCloudUnenroll(cfg)
-	case "projects":
-		cmdCloudProjects(cfg)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown cloud command: %s\n", os.Args[2])
-		fmt.Fprintln(os.Stderr, "usage: engram cloud <serve|register|login|sync|sync-status|status|api-key|enroll|unenroll|projects>")
-		exitFunc(1)
-		return
-	}
-}
-
-func cmdCloudServe() {
-	cloudCfg := cloud.ConfigFromEnv()
-	cloudCfg.DSN = cloud.DatabaseURLFromEnv()
-	cloudCfg.JWTSecret = cloud.JWTSecretFromEnv()
-
-	for i := 3; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--port":
-			if i+1 < len(os.Args) {
-				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
-					cloudCfg.Port = n
-				}
-				i++
-			}
-		case "--database-url":
-			if i+1 < len(os.Args) {
-				cloudCfg.DSN = os.Args[i+1]
-				i++
-			}
-		}
-	}
-
-	if cloudCfg.DSN == "" {
-		fmt.Fprintln(os.Stderr, "error: --database-url or ENGRAM_DATABASE_URL is required")
-		exitFunc(1)
-		return
-	}
-
-	if cloudCfg.JWTSecret == "" {
-		fmt.Fprintln(os.Stderr, "error: ENGRAM_JWT_SECRET environment variable is required (>= 32 chars)")
-		exitFunc(1)
-		return
-	}
-
-	cs, err := cloudStoreNew(cloudCfg)
-	if err != nil {
-		fatal(err)
-		return
-	}
-	defer cloudStoreClose(cs)
-
-	authSvc, err := cloudAuthNew(cs, cloudCfg.JWTSecret)
-	if err != nil {
-		fatal(err)
-		return
-	}
-
-	dashCfg := dashboard.DashboardConfig{
-		AdminEmail: cloudCfg.AdminEmail,
-	}
-	srv := cloudServerNew(cs, authSvc, cloudCfg.Port, cloudserver.WithDashboard(dashCfg))
-	if err := cloudServerStart(srv); err != nil {
-		fatal(err)
-		return
-	}
-}
-
-func cmdCloudRegister(dataDir string) {
-	serverURL := ""
-	for i := 3; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--server":
-			if i+1 < len(os.Args) {
-				serverURL = os.Args[i+1]
-				i++
-			}
-		}
-	}
-	if serverURL == "" {
-		fmt.Fprintln(os.Stderr, "error: --server is required")
-		exitFunc(1)
-		return
-	}
-
-	scanner := stdinScanner()
-
-	fmt.Print("Username: ")
-	scanner.Scan()
-	username := strings.TrimSpace(scanner.Text())
-
-	fmt.Print("Email: ")
-	scanner.Scan()
-	email := strings.TrimSpace(scanner.Text())
-
-	fmt.Print("Password: ")
-	scanner.Scan()
-	password := strings.TrimSpace(scanner.Text())
-
-	if username == "" || email == "" || password == "" {
-		fmt.Fprintln(os.Stderr, "error: username, email, and password are required")
-		exitFunc(1)
-		return
-	}
-
-	// Call POST /auth/register
-	reqBody, _ := json.Marshal(map[string]string{
-		"username": username,
-		"email":    email,
-		"password": password,
-	})
-
-	resp, err := cloudHTTPClient().Post(
-		strings.TrimRight(serverURL, "/")+"/auth/register",
-		"application/json",
-		bytes.NewReader(reqBody),
-	)
-	if err != nil {
-		fatal(fmt.Errorf("register: %w", err))
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusCreated {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			fatal(fmt.Errorf("register failed: %s", errResp.Error))
-		}
-		fatal(fmt.Errorf("register failed: %s", resp.Status))
-	}
-
-	var result auth.AuthResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		fatal(fmt.Errorf("parse register response: %w", err))
-	}
-
-	// Save credentials to config file
-	cc := &CloudConfig{
-		ServerURL:    serverURL,
-		Token:        result.AccessToken,
-		RefreshToken: result.RefreshToken,
-		UserID:       result.UserID,
-		Username:     result.Username,
-	}
-	if err := saveCloudConfig(dataDir, cc); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not save config: %v\n", err)
-	}
-
-	fmt.Printf("Registered as %s (user_id: %s)\n", result.Username, result.UserID)
-	fmt.Printf("Credentials saved to %s\n", cloudConfigPath(dataDir))
-}
-
-func cmdCloudLogin(dataDir string) {
-	serverURL := ""
-	for i := 3; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--server":
-			if i+1 < len(os.Args) {
-				serverURL = os.Args[i+1]
-				i++
-			}
-		}
-	}
-	if serverURL == "" {
-		fmt.Fprintln(os.Stderr, "error: --server is required")
-		exitFunc(1)
-		return
-	}
-
-	scanner := stdinScanner()
-
-	fmt.Print("Username or email: ")
-	scanner.Scan()
-	identifier := strings.TrimSpace(scanner.Text())
-
-	fmt.Print("Password: ")
-	scanner.Scan()
-	password := strings.TrimSpace(scanner.Text())
-
-	if identifier == "" || password == "" {
-		fmt.Fprintln(os.Stderr, "error: username or email and password are required")
-		exitFunc(1)
-		return
-	}
-
-	// Call POST /auth/login
-	reqBody, _ := json.Marshal(map[string]string{
-		"identifier": identifier,
-		"password":   password,
-	})
-
-	resp, err := cloudHTTPClient().Post(
-		strings.TrimRight(serverURL, "/")+"/auth/login",
-		"application/json",
-		bytes.NewReader(reqBody),
-	)
-	if err != nil {
-		fatal(fmt.Errorf("login: %w", err))
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			fatal(fmt.Errorf("login failed: %s", errResp.Error))
-		}
-		fatal(fmt.Errorf("login failed: %s", resp.Status))
-	}
-
-	var result auth.AuthResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		fatal(fmt.Errorf("parse login response: %w", err))
-	}
-
-	cc := &CloudConfig{
-		ServerURL:    serverURL,
-		Token:        result.AccessToken,
-		RefreshToken: result.RefreshToken,
-		UserID:       result.UserID,
-		Username:     result.Username,
-	}
-	if err := saveCloudConfig(dataDir, cc); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not save config: %v\n", err)
-	}
-
-	fmt.Printf("Logged in as %s\n", result.Username)
-	fmt.Printf("Credentials saved to %s\n", cloudConfigPath(dataDir))
-}
-
-func cmdCloudSync(cfg store.Config) {
-	serverURL := ""
-	token := ""
-	useLegacy := false
-	for i := 3; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--server", "--remote", "-r":
-			if i+1 < len(os.Args) {
-				serverURL = os.Args[i+1]
-				i++
-			}
-		case "--token", "-t":
-			if i+1 < len(os.Args) {
-				token = os.Args[i+1]
-				i++
-			}
-		case "--legacy":
-			useLegacy = true
-		}
-	}
-
-	serverURL, token, err := resolveCloudClientConfig(cfg.DataDir, serverURL, token, true)
-	if err != nil {
-		fatal(err)
-	}
-	if serverURL == "" || token == "" {
-		fatal(fmt.Errorf("cloud config missing server_url or token (run 'engram cloud login' first)"))
-	}
-
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	rt, err := remoteTransportNew(serverURL, token)
-	if err != nil {
-		fatal(err)
-	}
-	if cc, err := loadCloudConfig(cfg.DataDir); err == nil && cc != nil && cc.ServerURL == serverURL && cc.RefreshToken != "" {
-		rt.SetTokenRefresher(cc.RefreshToken, func(newToken string) error {
-			cc.Token = newToken
-			return saveCloudConfig(cfg.DataDir, cc)
-		})
-	}
-
-	// Legacy chunk-based sync (deprecated — preserved for backward compatibility).
-	if useLegacy {
-		handleRemoteSync(s, rt, false, false, true, "")
-		return
-	}
-
-	// New mutation-safe foreground sync using the autosync engine.
-	syncCfg := autosyncDefaultCg()
-	syncCfg.PollInterval = 0 // no periodic polling in foreground mode
-	mgr := autosyncNew(s, rt, syncCfg)
-
-	fmt.Printf("Syncing with %s...\n", serverURL)
-
-	// Run a single sync cycle in foreground.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Trigger an immediate cycle and wait.
-	done := make(chan struct{})
-	go func() {
-		mgr.Run(ctx)
-		close(done)
-	}()
-
-	mgr.NotifyDirty()
-
-	// Wait for the first cycle to complete (healthy or failed).
-	for {
-		status := mgr.Status()
-		switch status.Phase {
-		case autosync.PhaseHealthy:
-			cancel()
-			<-done
-			fmt.Println("Sync complete.")
-			return
-		case autosync.PhasePushFailed, autosync.PhasePullFailed, autosync.PhaseBackoff:
-			cancel()
-			<-done
-			if status.LastError != "" {
-				fatal(fmt.Errorf("sync failed: %s", status.LastError))
-			}
-			fatal(fmt.Errorf("sync failed (phase: %s)", status.Phase))
-			return
-		}
-		// Brief sleep to avoid busy-wait.
-		select {
-		case <-done:
-			return
-		default:
-		}
-	}
-}
-
-// cmdCloudSyncStatus shows the local sync state from SQLite (mutation journal, degraded state).
-func cmdCloudSyncStatus(cfg store.Config) {
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	state, err := s.GetSyncState(store.DefaultSyncTargetKey)
-	if err != nil {
-		fmt.Println("Cloud sync status: not initialized")
-		fmt.Println("  Run 'engram cloud login' and then 'engram cloud sync' to start syncing.")
-		return
-	}
-
-	fmt.Println("Cloud sync status (local):")
-	fmt.Printf("  Lifecycle:           %s\n", state.Lifecycle)
-	fmt.Printf("  Last enqueued seq:   %d\n", state.LastEnqueuedSeq)
-	fmt.Printf("  Last acked seq:      %d\n", state.LastAckedSeq)
-	fmt.Printf("  Last pulled seq:     %d\n", state.LastPulledSeq)
-
-	pending := state.LastEnqueuedSeq - state.LastAckedSeq
-	if pending < 0 {
-		pending = 0
-	}
-	fmt.Printf("  Pending mutations:   %d\n", pending)
-
-	if state.ConsecutiveFailures > 0 {
-		fmt.Printf("  Consecutive failures: %d\n", state.ConsecutiveFailures)
-	}
-	if state.LastError != nil && *state.LastError != "" {
-		fmt.Printf("  Last error:          %s\n", *state.LastError)
-	}
-	if state.BackoffUntil != nil && *state.BackoffUntil != "" {
-		fmt.Printf("  Backoff until:       %s\n", *state.BackoffUntil)
-	}
-	if state.LeaseOwner != nil && *state.LeaseOwner != "" {
-		fmt.Printf("  Lease owner:         %s\n", *state.LeaseOwner)
-	}
-}
-
-func cmdCloudStatus(cfg store.Config) {
-	serverURL := ""
-	token := ""
-	for i := 3; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "--server", "--remote", "-r":
-			if i+1 < len(os.Args) {
-				serverURL = os.Args[i+1]
-				i++
-			}
-		case "--token", "-t":
-			if i+1 < len(os.Args) {
-				token = os.Args[i+1]
-				i++
-			}
-		}
-	}
-
-	serverURL, token, err := resolveCloudClientConfig(cfg.DataDir, serverURL, token, true)
-	if err != nil {
-		fatal(err)
-	}
-	if serverURL == "" || token == "" {
-		fatal(fmt.Errorf("cloud config missing server_url or token (run 'engram cloud login' first)"))
-	}
-
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	rt, err := remoteTransportNew(serverURL, token)
-	if err != nil {
-		fatal(err)
-	}
-	sy := engramsync.NewWithTransport(s, rt)
-
-	local, remoteCount, pending, err := syncStatus(sy)
-	if err != nil {
-		fatal(err)
-	}
-
-	fmt.Printf("Cloud sync status:\n")
-	fmt.Printf("  Server:          %s\n", serverURL)
-	fmt.Printf("  Local chunks:    %d\n", local)
-	fmt.Printf("  Remote chunks:   %d\n", remoteCount)
-	fmt.Printf("  Pending import:  %d\n", pending)
-}
-
-func cmdCloudAPIKey(dataDir string) {
-	cc, err := loadCloudConfig(dataDir)
-	if err != nil {
-		fatal(fmt.Errorf("load cloud config: %w (run 'engram cloud login' first)", err))
-	}
-	if cc.ServerURL == "" || cc.Token == "" {
-		fatal(fmt.Errorf("cloud config missing server_url or token (run 'engram cloud login' first)"))
-	}
-
-	client := cloudHTTPClient()
-	req, err := http.NewRequest("POST", strings.TrimRight(cc.ServerURL, "/")+"/auth/api-key", nil)
-	if err != nil {
-		fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+cc.Token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fatal(fmt.Errorf("api-key: %w", err))
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusCreated {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			fatal(fmt.Errorf("api-key failed: %s", errResp.Error))
-		}
-		fatal(fmt.Errorf("api-key failed: %s", resp.Status))
-	}
-
-	var result struct {
-		APIKey  string `json:"api_key"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		fatal(fmt.Errorf("parse api-key response: %w", err))
-	}
-
-	fmt.Printf("API Key: %s\n", result.APIKey)
-	fmt.Println("WARNING: Store this key securely. It will not be shown again.")
-}
-
-// ─── Enrollment Commands ─────────────────────────────────────────────────────
-
-// cmdCloudEnroll enrolls a project for cloud sync.
-func cmdCloudEnroll(cfg store.Config) {
-	if len(os.Args) < 4 {
-		fmt.Fprintln(os.Stderr, "usage: engram cloud enroll <project>")
-		exitFunc(1)
-		return
-	}
-
-	project := os.Args[3]
-
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	if err := s.EnrollProject(project); err != nil {
-		fatal(err)
-	}
-
-	fmt.Printf("Project %q enrolled for cloud sync.\n", project)
-}
-
-// cmdCloudUnenroll removes a project from cloud sync enrollment.
-func cmdCloudUnenroll(cfg store.Config) {
-	if len(os.Args) < 4 {
-		fmt.Fprintln(os.Stderr, "usage: engram cloud unenroll <project>")
-		exitFunc(1)
-		return
-	}
-
-	project := os.Args[3]
-
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	if err := s.UnenrollProject(project); err != nil {
-		fatal(err)
-	}
-
-	fmt.Printf("Project %q unenrolled from cloud sync.\n", project)
-}
-
-// cmdCloudProjects lists all projects currently enrolled for cloud sync.
-func cmdCloudProjects(cfg store.Config) {
-	s, err := storeNew(cfg)
-	if err != nil {
-		fatal(err)
-	}
-	defer s.Close()
-
-	projects, err := s.ListEnrolledProjects()
-	if err != nil {
-		fatal(err)
-	}
-
-	if len(projects) == 0 {
-		fmt.Println("No projects enrolled for cloud sync.")
-		fmt.Println("  Use 'engram cloud enroll <project>' to enroll a project.")
-		return
-	}
-
-	fmt.Printf("Enrolled projects (%d):\n", len(projects))
-	for _, p := range projects {
-		fmt.Printf("  %s  (enrolled: %s)\n", p.Project, p.EnrolledAt)
-	}
-}
-
-// ─── Remote Search/Context Helpers ───────────────────────────────────────────
-
-func remoteSearch(serverURL, token, query string, opts store.SearchOptions) {
-	u := strings.TrimRight(serverURL, "/") + "/sync/search?q=" + query
-	if opts.Type != "" {
-		u += "&type=" + opts.Type
-	}
-	if opts.Project != "" {
-		u += "&project=" + opts.Project
-	}
-	if opts.Scope != "" {
-		u += "&scope=" + opts.Scope
-	}
-	if opts.Limit > 0 {
-		u += "&limit=" + strconv.Itoa(opts.Limit)
-	}
-
-	req, err := http.NewRequest("GET", u, nil)
-	if err != nil {
-		fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := cloudHTTPClient().Do(req)
-	if err != nil {
-		fatal(fmt.Errorf("remote search: %w", err))
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			fatal(fmt.Errorf("remote search: %s", errResp.Error))
-		}
-		fatal(fmt.Errorf("remote search: %s", resp.Status))
-	}
-
-	var searchResp struct {
-		Results []struct {
-			ID        int64   `json:"id"`
-			Type      string  `json:"type"`
-			Title     string  `json:"title"`
-			Content   string  `json:"content"`
-			Project   *string `json:"project"`
-			Scope     string  `json:"scope"`
-			Rank      float64 `json:"rank"`
-			CreatedAt string  `json:"created_at"`
-		} `json:"results"`
-	}
-	if err := json.Unmarshal(body, &searchResp); err != nil {
-		fatal(fmt.Errorf("parse remote search: %w", err))
-	}
-
-	if len(searchResp.Results) == 0 {
-		fmt.Printf("No memories found for: %q\n", query)
-		return
-	}
-
-	fmt.Printf("Found %d memories (cloud):\n\n", len(searchResp.Results))
-	for i, r := range searchResp.Results {
-		project := ""
-		if r.Project != nil {
-			project = fmt.Sprintf(" | project: %s", *r.Project)
-		}
-		fmt.Printf("[%d] #%d (%s) — %s\n    %s\n    %s%s | scope: %s\n\n",
-			i+1, r.ID, r.Type, r.Title,
-			truncate(r.Content, 300),
-			r.CreatedAt, project, r.Scope)
-	}
-}
-
-func remoteContext(serverURL, token, project, scope string) {
-	u := strings.TrimRight(serverURL, "/") + "/sync/context"
-	params := []string{}
-	if project != "" {
-		params = append(params, "project="+project)
-	}
-	if scope != "" {
-		params = append(params, "scope="+scope)
-	}
-	if len(params) > 0 {
-		u += "?" + strings.Join(params, "&")
-	}
-
-	req, err := http.NewRequest("GET", u, nil)
-	if err != nil {
-		fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := cloudHTTPClient().Do(req)
-	if err != nil {
-		fatal(fmt.Errorf("remote context: %w", err))
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			fatal(fmt.Errorf("remote context: %s", errResp.Error))
-		}
-		fatal(fmt.Errorf("remote context: %s", resp.Status))
-	}
-
-	var ctxResp struct {
-		Context string `json:"context"`
-	}
-	if err := json.Unmarshal(body, &ctxResp); err != nil {
-		fatal(fmt.Errorf("parse remote context: %w", err))
-	}
-
-	if ctxResp.Context == "" {
-		fmt.Println("No previous session memories found.")
-		return
-	}
-
-	fmt.Print(ctxResp.Context)
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func printUsage() {
@@ -1807,11 +796,9 @@ Commands:
                        Example: engram mcp --tools=agent
   tui                Launch interactive terminal UI
   search <query>     Search memories [--type TYPE] [--project PROJECT] [--scope SCOPE] [--limit N]
-                       [--remote URL] [--token TOKEN]  Query cloud server instead of local DB
   save <title> <msg> Save a memory  [--type TYPE] [--project PROJECT] [--scope SCOPE]
   timeline <obs_id>  Show chronological context around an observation [--before N] [--after N]
   context [project]  Show recent context from previous sessions
-                       [--remote URL] [--token TOKEN]  Query cloud server instead of local DB
   stats              Show memory system statistics
   export [file]      Export all memories to JSON (default: engram-export.json)
   import <file>      Import memories from a JSON export file
@@ -1822,32 +809,12 @@ Commands:
                        --project  Filter export to a specific project
                        --all      Export ALL projects (ignore directory-based filter)
 
-  cloud serve        Start cloud server (Postgres backend)
-                       --port PORT          HTTP port (default: 8080)
-                       --database-url URL   Postgres DSN (or ENGRAM_DATABASE_URL env)
-  cloud register     Register a new cloud account
-                       --server URL         Cloud server URL (required)
-  cloud login        Login to an existing cloud account
-                       --server URL         Cloud server URL (required)
-  cloud sync         Sync local mutations to cloud (push + pull)
-                       --legacy   Use legacy chunk-based sync (deprecated)
-  cloud sync-status  Show local sync journal state (pending mutations, degraded state)
-  cloud status       Show cloud sync status (local vs remote chunks, legacy)
-  cloud api-key      Generate a new API key for the cloud server
-  cloud enroll <p>   Enroll a project for cloud sync (only enrolled projects are pushed)
-  cloud unenroll <p> Unenroll a project from cloud sync
-  cloud projects     List projects currently enrolled for cloud sync
-
   version            Print version
   help               Show this help
 
 Environment:
   ENGRAM_DATA_DIR    Override data directory (default: ~/.engram)
   ENGRAM_PORT        Override HTTP server port (default: 7437)
-  ENGRAM_REMOTE_URL  Cloud server URL (used by --remote flag)
-  ENGRAM_TOKEN       Cloud auth token (used by --token flag)
-  ENGRAM_DATABASE_URL  Postgres DSN for cloud serve
-  ENGRAM_JWT_SECRET    JWT signing secret for cloud serve (>= 32 chars)
 
 MCP Configuration (add to your agent's config):
   {

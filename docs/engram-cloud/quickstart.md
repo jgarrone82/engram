@@ -65,6 +65,35 @@ engram cloud upgrade status --project smoke-project
 
 ---
 
+## Deploy with Official GHCR Image (Dokploy/Coolify/Portainer/VPS)
+
+Do not build from source for production deploys. Use the published image:
+
+- `ghcr.io/gentleman-programming/engram-cloud:latest`
+
+Reference compose file:
+- [docker-compose.ghcr.yml](./docker-compose.ghcr.yml)
+
+Required runtime env vars:
+- `ENGRAM_DATABASE_URL`
+- `ENGRAM_CLOUD_TOKEN`
+- `ENGRAM_CLOUD_ADMIN`
+- `ENGRAM_JWT_SECRET`
+- `ENGRAM_CLOUD_ALLOWED_PROJECTS`
+- `ENGRAM_CLOUD_HOST=0.0.0.0`
+- `ENGRAM_PORT=18080`
+
+Dokploy guidance:
+1. Create a managed Postgres service.
+2. Create an app from image `ghcr.io/gentleman-programming/engram-cloud:latest`.
+3. Configure the env vars above (with strong secrets).
+4. Expose container port `18080`.
+5. Avoid build-from-source mode unless you are actively developing Engram itself.
+
+> `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` is for local/dev smoke only. Never use it in production.
+
+---
+
 ## Common Failure Reasons
 
 | Reason code | Meaning |
@@ -104,6 +133,7 @@ Rules that matter:
 - `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` cannot be combined with `ENGRAM_CLOUD_TOKEN`
 - `ENGRAM_CLOUD_ALLOWED_PROJECTS` is required server-side in both modes
 - authenticated mode requires explicit non-default `ENGRAM_JWT_SECRET`
+- `ENGRAM_CLOUD_INSECURE_NO_AUTH=1` remains local/dev only (never production)
 
 </details>
 

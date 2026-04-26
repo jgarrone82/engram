@@ -32,6 +32,23 @@ Continue with full verification and expected outputs in [Quickstart](./quickstar
 
 ---
 
+## Public Container Image (GHCR)
+
+Engram Cloud publishes an official image at:
+
+- `ghcr.io/gentleman-programming/engram-cloud`
+
+Supported platforms:
+- `linux/amd64`
+- `linux/arm64`
+
+Why Linux only? Docker containers run Linux in production platforms (and also inside Docker Desktop VMs on macOS/Windows), so these are the portable targets that matter for Dokploy/Coolify/Portainer/VPS deployments.
+
+For a direct registry-based deploy example, use:
+- [docker-compose.ghcr.yml](./docker-compose.ghcr.yml)
+
+---
+
 ## What Engram Cloud Is
 
 - **Project-scoped replication**: each sync call is tied to one explicit `--project`
@@ -65,6 +82,7 @@ Continue with full verification and expected outputs in [Quickstart](./quickstar
 | Doc | Purpose |
 |---|---|
 | [Quickstart](./quickstart.md) | One recommended path first, then authenticated mode |
+| [GHCR Compose Example](./docker-compose.ghcr.yml) | Pull-and-run deployment sample for Dokploy/Coolify/Portainer/VPS |
 | [Branding](./branding.md) | Engram Cloud visual identity, asset usage, previews |
 | [Technical Cloud Reference](../../DOCS.md#cloud-cli-opt-in) | Full CLI + env/runtime details |
 | [Cloud Autosync](../../DOCS.md#cloud-autosync) | Background replication behavior + phase table |

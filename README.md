@@ -1,5 +1,5 @@
 <p align="center">
-  <img width="1024" height="340" alt="image" src="https://github.com/user-attachments/assets/32ed8985-841d-49c3-81f7-2aabc7c7c564" />
+  <img width="1024" alt="Engram Cloud" src="assets/branding/engram-cloud-logo.png" />
 </p>
 
 <p align="center">
